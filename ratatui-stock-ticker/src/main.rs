@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap, fs, net::{Ipv4Addr, UdpSocket}, time::Duration
+    collections::HashMap, fmt, fs, net::{Ipv4Addr, UdpSocket}, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use color_eyre::eyre::{Context, eyre};
@@ -49,6 +49,7 @@ const WATCHLIST: &[&str] = &[
 
 pub enum ItchyMessage {
     StockTick(Trade),
+    Reset,
 }
 
 pub struct Trade {
@@ -57,7 +58,7 @@ pub struct Trade {
 }
 
 impl Trade {
-    pub fn try_from_hashmap(map: HashMap<&str, &str>) -> color_eyre::Result<Trade> {
+    pub fn try_from_hashmap(map: &HashMap<&str, &str>) -> color_eyre::Result<Trade> {
         let symbol = map.get("symbol").ok_or_else(|| eyre!("missing: symbol"))?;
         let price_raw = map.get("price").ok_or_else(|| eyre!("missing: price"))?;
         Ok(Trade {
@@ -67,9 +68,67 @@ impl Trade {
     }
 }
 
+const LATENCY_BATCH: u128 = 1000;
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct Stats {
+    pub last_seq: u32,
+    pub drop_count: u32,
+    pub total_count: u32,
+    pub latency_us: u128,
+    latency_sum: u128,
+    latency_count: u128,
+}
+
+impl Stats {
+    /// Updates seq, drop count, and latency stats. Returns true if seq=0 (reset).
+    pub fn update(&mut self, pairs: &HashMap<&str, &str>) -> color_eyre::Result<bool> {
+        let seq: u32 = match pairs.get("seq").copied() {
+            Some(s) => s.parse()?,
+            _ => return Err(eyre!("missing seq")),
+        };
+        if seq == 0 {
+            *self = Self::default();
+            return Ok(true);
+        }
+        if seq > self.last_seq + 1 {
+            self.drop_count += seq - (self.last_seq + 1);
+        }
+        self.last_seq = seq;
+        self.total_count += 1;
+        let sender_ts: u128 = match pairs.get("ts").copied() {
+            Some(s) => s.parse()?,
+            _ => return Err(eyre!("missing ts")),
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        self.latency_sum += now.saturating_sub(sender_ts);
+        self.latency_count += 1;
+        if self.latency_count >= LATENCY_BATCH {
+            self.latency_us = self.latency_sum / self.latency_count;
+            self.latency_sum = 0;
+            self.latency_count = 0;
+        }
+        Ok(false)
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "total:{},last:{},dropped:{},latency:{}us",
+            self.total_count, self.last_seq, self.drop_count, self.latency_us
+        )
+    }
+}
+
 pub struct ItchTickListener {
     pub socket: UdpSocket,
     pub messages: Vec<ItchyMessage>,
+    pub stats: Stats,
 }
 
 impl ItchTickListener {
@@ -84,6 +143,7 @@ impl ItchTickListener {
         Ok(Self {
             socket,
             messages: vec![],
+            stats: Stats::default(),
         })
     }
 
@@ -96,12 +156,17 @@ impl ItchTickListener {
             let datagram = String::from_utf8_lossy(&buf[..len]).to_string();
             let pairs = ItchTickListener::parse_message(datagram.as_str());
             let itchy_message = match pairs.get("kind").copied() {
-                Some("tick") => Trade::try_from_hashmap(pairs).map(ItchyMessage::StockTick),
+                Some("tick") => Trade::try_from_hashmap(&pairs).map(ItchyMessage::StockTick),
                 _ => Err(eyre!("unknown kind")),
             }
             .wrap_err_with(|| format!("raw datagram: {datagram}"))?;
 
             messages.push(itchy_message);
+            if self.stats.update(&pairs)? {
+                messages.clear();
+                messages.push(ItchyMessage::Reset);
+                continue;
+            }
         }
         Ok(messages)
     }
@@ -137,6 +202,7 @@ impl App {
         // Ignore if there's no file here, ideally we would alert the user
         // but not going to bother here since that isn't part of the demo
         let _ = self.load_symbols();
+        let _ = self.load_stats();
         while self.running {
             let messages = self.itchy_listener.receive()?;
             for msg in messages.iter() {
@@ -144,9 +210,13 @@ impl App {
                     ItchyMessage::StockTick(trade) => {
                         self.symbols.insert(trade.symbol.to_owned(), trade.price);
                     }
+                    ItchyMessage::Reset => {
+                        self.symbols.clear();
+                    }
                 }
             }
             self.persist_symbols()?;
+            self.persist_stats()?;
             terminal.draw(|frame| self.render(frame))?;
             self.handle_crossterm_events()?;
         }
@@ -160,9 +230,21 @@ impl App {
         Ok(())
     }
 
+    fn persist_stats(&self) -> color_eyre::Result<()> {
+        let bytes = rmp_serde::to_vec(&self.itchy_listener.stats)?;
+        fs::write(".data/stats.msgpack", bytes)?;
+        Ok(())
+    }
+
     fn load_symbols(&mut self) -> color_eyre::Result<()> {
         let bytes = fs::read(".data/snapshot.msgpack")?;
         self.symbols = rmp_serde::from_slice(&bytes)?;
+        Ok(())
+    }
+
+    fn load_stats(&mut self) -> color_eyre::Result<()> {
+        let bytes = fs::read(".data/stats.msgpack")?;
+        self.itchy_listener.stats = rmp_serde::from_slice(&bytes)?;
         Ok(())
     }
 
@@ -183,13 +265,15 @@ impl App {
             .constraints(vec![Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(outer_layout[0]);
 
-        let title = Line::from("Ratatui Simple Template")
+        let title = Line::from("Ratatui Simple Stock Ticker")
             .bold()
             .blue()
             .centered();
-        let text = "Hello, Ratatui stock ticker!\n\n\
-            Created using https://github.com/ratatui/templates\n\
-            Press `Esc`, `Ctrl-C` or `q` to stop running.";
+        let status_txt = self.itchy_listener.stats.to_string();
+        let text = format!(
+            "{status_txt} 
+            Press `Esc`, `Ctrl-C` or `q` to stop running."
+        );
         frame.render_widget(
             Paragraph::new(text)
                 .block(Block::bordered().title(title))
@@ -214,7 +298,7 @@ impl App {
 
     /// Reads the crossterm events and updates the state of [`App`].
     fn handle_crossterm_events(&mut self) -> color_eyre::Result<()> {
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(Duration::ZERO)? {
             match event::read()? {
                 // it's important to check KeyEventKind::Press to avoid handling key release events
                 Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
