@@ -215,8 +215,8 @@ impl App {
                     }
                 }
             }
-            self.persist_symbols()?;
-            self.persist_stats()?;
+            // self.persist_symbols()?;
+            // self.persist_stats()?;
             terminal.draw(|frame| self.render(frame))?;
             self.handle_crossterm_events()?;
         }
@@ -322,6 +322,8 @@ impl App {
 
     /// Set running to false to quit the application.
     fn quit(&mut self) {
+        let _ = self.persist_symbols();
+        let _ = self.persist_stats();
         self.running = false;
     }
 }
