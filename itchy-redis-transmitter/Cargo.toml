@@ -1,0 +1,9 @@
+[package]
+name = "itchy-redis-transmitter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+itchy = "0.3.4"
+rust_decimal = "1.40.0"
+redis = { version = "0.27", features = ["streams"] }

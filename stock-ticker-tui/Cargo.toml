@@ -12,6 +12,8 @@ ratatui = "0.30.0"
 color-eyre = "0.6.3"
 serde = { version = "1.0.228", features = ["derive"] }
 rmp-serde = "1.3.1"
+redis = { version = "0.27", features = ["streams"] }
+clap = { version = "4", features = ["derive"] }
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

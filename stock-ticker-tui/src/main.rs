@@ -1,11 +1,15 @@
+mod reader;
+mod udp_reader;
+mod redis_reader;
+
 use std::{
-    collections::HashMap, fmt, fs, net::{Ipv4Addr, UdpSocket},
-    sync::mpsc::{self, Receiver},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::HashMap, fmt, fs,
+    sync::mpsc::Receiver,
+    time::Duration,
 };
 
-use color_eyre::eyre::{Context, eyre};
+use clap::Parser;
+use color_eyre::eyre::eyre;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::{
@@ -15,10 +19,27 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
+use reader::PacketReader;
+use udp_reader::UdpMulticastReader;
+use redis_reader::RedisStreamReader;
+
+#[derive(Parser)]
+struct Cli {
+    /// Source to read from: "udp" or "redis"
+    #[arg(long, default_value = "udp")]
+    source: String,
+}
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    let cli = Cli::parse();
+    let rx = match cli.source.as_str() {
+        "udp" => UdpMulticastReader::default().spawn()?,
+        "redis" => RedisStreamReader::default().spawn()?,
+        other => return Err(eyre!("unknown source: {other}")),
+    };
     let terminal = ratatui::init();
-    let result = App::new()?.run(terminal);
+    let result = App::new(rx).run(terminal);
     ratatui::restore();
     result
 }
@@ -56,12 +77,12 @@ pub enum ItchyMessage {
 }
 
 pub struct Trade {
-    price: f32,
-    symbol: String,
+    pub price: f32,
+    pub symbol: String,
 }
 
 impl Trade {
-    pub fn try_from_hashmap(map: &HashMap<&str, &str>) -> color_eyre::Result<Trade> {
+    pub fn try_from_hashmap(map: &HashMap<String, String>) -> color_eyre::Result<Trade> {
         let symbol = map.get("symbol").ok_or_else(|| eyre!("missing: symbol"))?;
         let price_raw = map.get("price").ok_or_else(|| eyre!("missing: price"))?;
         Ok(Trade {
@@ -119,72 +140,10 @@ impl fmt::Display for Stats {
     }
 }
 
-/// Spawns a reader thread that drains UDP as fast as possible and sends
-/// parsed messages over a channel. Latency is measured here, at read time,
-/// not when the TUI processes the message.
-struct Packet {
-    msg: ItchyMessage,
-    seq: u32,
-    latency_us: u128,
-}
-
-fn spawn_reader() -> std::io::Result<Receiver<color_eyre::Result<Packet>>> {
-    let socket = UdpSocket::bind("0.0.0.0:1234")?;
-    socket.join_multicast_v4(
-        &"239.255.0.1".parse::<Ipv4Addr>().unwrap(),
-        &Ipv4Addr::UNSPECIFIED,
-    )?;
-
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            let Ok((len, _)) = socket.recv_from(&mut buf) else {
-                continue;
-            };
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_micros();
-            let datagram = String::from_utf8_lossy(&buf[..len]).to_string();
-            let pairs = parse_message(&datagram);
-
-            let result = (|| -> color_eyre::Result<Packet> {
-                let seq: u32 = match pairs.get("seq").copied() {
-                    Some(s) => s.parse()?,
-                    _ => return Err(eyre!("missing seq")),
-                };
-                let sender_ts: u128 = match pairs.get("ts").copied() {
-                    Some(s) => s.parse()?,
-                    _ => return Err(eyre!("missing ts")),
-                };
-                let msg = match pairs.get("kind").copied() {
-                    Some("tick") => Trade::try_from_hashmap(&pairs).map(ItchyMessage::StockTick)?,
-                    _ if seq == 0 => ItchyMessage::Reset,
-                    other => return Err(eyre!("unknown kind: {:?}", other)),
-                };
-                Ok(Packet {
-                    msg,
-                    seq,
-                    latency_us: now.saturating_sub(sender_ts),
-                })
-            })()
-            .wrap_err_with(|| format!("raw datagram: {datagram}"));
-
-            if tx.send(result).is_err() {
-                break;
-            }
-        }
-    });
-
-    Ok(rx)
-}
-
-fn parse_message(s: &str) -> HashMap<&str, &str> {
-    s.split(';')
-        .filter_map(|pair| pair.split_once('='))
-        .collect()
+pub struct Packet {
+    pub msg: ItchyMessage,
+    pub seq: u32,
+    pub latency_us: u128,
 }
 
 /// The main application which holds the state and logic of the application.
@@ -197,14 +156,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> std::io::Result<Self> {
-        let rx = spawn_reader()?;
-        Ok(Self {
+    pub fn new(rx: Receiver<color_eyre::Result<Packet>>) -> Self {
+        Self {
             running: true,
             rx,
             stats: Stats::default(),
             symbols: HashMap::<String, f32>::new(),
-        })
+        }
     }
 
     /// Run the application's main loop.
