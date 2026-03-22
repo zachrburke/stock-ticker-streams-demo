@@ -1,7 +1,5 @@
 use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, UdpSocket},
-    time::Duration,
+    collections::HashMap, fs, net::{Ipv4Addr, UdpSocket}, time::Duration
 };
 
 use color_eyre::eyre::{Context, eyre};
@@ -136,6 +134,9 @@ impl App {
     /// Run the application's main loop.
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         self.running = true;
+        // Ignore if there's no file here, ideally we would alert the user
+        // but not going to bother here since that isn't part of the demo
+        let _ = self.load_symbols();
         while self.running {
             let messages = self.itchy_listener.receive()?;
             for msg in messages.iter() {
@@ -145,9 +146,23 @@ impl App {
                     }
                 }
             }
+            self.persist_symbols()?;
             terminal.draw(|frame| self.render(frame))?;
             self.handle_crossterm_events()?;
         }
+        Ok(())
+    }
+
+    fn persist_symbols(&self) -> color_eyre::Result<()> {
+        fs::create_dir_all(".data")?;
+        let bytes = rmp_serde::to_vec(&self.symbols)?;
+        fs::write(".data/snapshot.msgpack", bytes)?;
+        Ok(())
+    }
+
+    fn load_symbols(&mut self) -> color_eyre::Result<()> {
+        let bytes = fs::read(".data/snapshot.msgpack")?;
+        self.symbols = rmp_serde::from_slice(&bytes)?;
         Ok(())
     }
 
