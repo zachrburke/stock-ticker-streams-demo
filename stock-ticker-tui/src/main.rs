@@ -1,5 +1,8 @@
 use std::{
-    collections::HashMap, fmt, fs, net::{Ipv4Addr, UdpSocket}, time::{Duration, SystemTime, UNIX_EPOCH}
+    collections::HashMap, fmt, fs, net::{Ipv4Addr, UdpSocket},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use color_eyre::eyre::{Context, eyre};
@@ -22,7 +25,7 @@ fn main() -> color_eyre::Result<()> {
 
 const TOP_STOCKS: &[&str] = &[
     "AAPL", // Apple
-    "MSFT", // Microsfot 
+    "MSFT", // Microsfot
     "TSLA", // Tesla
     "GOOG", // Google
     "AMZN", // Amazon
@@ -81,37 +84,28 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// Updates seq, drop count, and latency stats. Returns true if seq=0 (reset).
-    pub fn update(&mut self, pairs: &HashMap<&str, &str>) -> color_eyre::Result<bool> {
-        let seq: u32 = match pairs.get("seq").copied() {
-            Some(s) => s.parse()?,
-            _ => return Err(eyre!("missing seq")),
-        };
+    /// Updates seq and drop count. Returns true if seq=0 (reset).
+    pub fn update(&mut self, seq: u32) -> bool {
         if seq == 0 {
             *self = Self::default();
-            return Ok(true);
+            return true;
         }
         if seq > self.last_seq + 1 {
             self.drop_count += seq - (self.last_seq + 1);
         }
         self.last_seq = seq;
         self.total_count += 1;
-        let sender_ts: u128 = match pairs.get("ts").copied() {
-            Some(s) => s.parse()?,
-            _ => return Err(eyre!("missing ts")),
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros();
-        self.latency_sum += now.saturating_sub(sender_ts);
+        false
+    }
+
+    pub fn record_latency(&mut self, latency_us: u128) {
+        self.latency_sum += latency_us;
         self.latency_count += 1;
         if self.latency_count >= LATENCY_BATCH {
             self.latency_us = self.latency_sum / self.latency_count;
             self.latency_sum = 0;
             self.latency_count = 0;
         }
-        Ok(false)
     }
 }
 
@@ -125,73 +119,90 @@ impl fmt::Display for Stats {
     }
 }
 
-pub struct ItchTickListener {
-    pub socket: UdpSocket,
-    pub messages: Vec<ItchyMessage>,
-    pub stats: Stats,
+/// Spawns a reader thread that drains UDP as fast as possible and sends
+/// parsed messages over a channel. Latency is measured here, at read time,
+/// not when the TUI processes the message.
+struct Packet {
+    msg: ItchyMessage,
+    seq: u32,
+    latency_us: u128,
 }
 
-impl ItchTickListener {
-    pub fn init() -> Result<Self, std::io::Error> {
-        let socket = UdpSocket::bind("0.0.0.0:1234")?;
-        socket.join_multicast_v4(
-            &"239.255.0.1".parse::<Ipv4Addr>().unwrap(),
-            &Ipv4Addr::UNSPECIFIED,
-        )?;
-        socket.set_nonblocking(true)?; // non-blocking so the TUI stays responsive
+fn spawn_reader() -> std::io::Result<Receiver<color_eyre::Result<Packet>>> {
+    let socket = UdpSocket::bind("0.0.0.0:1234")?;
+    socket.join_multicast_v4(
+        &"239.255.0.1".parse::<Ipv4Addr>().unwrap(),
+        &Ipv4Addr::UNSPECIFIED,
+    )?;
 
-        Ok(Self {
-            socket,
-            messages: vec![],
-            stats: Stats::default(),
-        })
-    }
+    let (tx, rx) = mpsc::channel();
 
-    pub fn receive(&mut self) -> color_eyre::Result<Vec<ItchyMessage>> {
-        let mut messages: Vec<ItchyMessage> = vec![];
+    thread::spawn(move || {
         let mut buf = [0u8; 4096];
-
-        // Drain incoming messages
-        while let Ok((len, _)) = self.socket.recv_from(&mut buf) {
-            let datagram = String::from_utf8_lossy(&buf[..len]).to_string();
-            let pairs = ItchTickListener::parse_message(datagram.as_str());
-            let itchy_message = match pairs.get("kind").copied() {
-                Some("tick") => Trade::try_from_hashmap(&pairs).map(ItchyMessage::StockTick),
-                _ => Err(eyre!("unknown kind")),
-            }
-            .wrap_err_with(|| format!("raw datagram: {datagram}"))?;
-
-            messages.push(itchy_message);
-            if self.stats.update(&pairs)? {
-                messages.clear();
-                messages.push(ItchyMessage::Reset);
+        loop {
+            let Ok((len, _)) = socket.recv_from(&mut buf) else {
                 continue;
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+            let datagram = String::from_utf8_lossy(&buf[..len]).to_string();
+            let pairs = parse_message(&datagram);
+
+            let result = (|| -> color_eyre::Result<Packet> {
+                let seq: u32 = match pairs.get("seq").copied() {
+                    Some(s) => s.parse()?,
+                    _ => return Err(eyre!("missing seq")),
+                };
+                let sender_ts: u128 = match pairs.get("ts").copied() {
+                    Some(s) => s.parse()?,
+                    _ => return Err(eyre!("missing ts")),
+                };
+                let msg = match pairs.get("kind").copied() {
+                    Some("tick") => Trade::try_from_hashmap(&pairs).map(ItchyMessage::StockTick)?,
+                    _ if seq == 0 => ItchyMessage::Reset,
+                    other => return Err(eyre!("unknown kind: {:?}", other)),
+                };
+                Ok(Packet {
+                    msg,
+                    seq,
+                    latency_us: now.saturating_sub(sender_ts),
+                })
+            })()
+            .wrap_err_with(|| format!("raw datagram: {datagram}"));
+
+            if tx.send(result).is_err() {
+                break;
             }
         }
-        Ok(messages)
-    }
+    });
 
-    fn parse_message(s: &str) -> HashMap<&str, &str> {
-        s.split(';')
-            .filter_map(|pair| pair.split_once('='))
-            .collect()
-    }
+    Ok(rx)
+}
+
+fn parse_message(s: &str) -> HashMap<&str, &str> {
+    s.split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .collect()
 }
 
 /// The main application which holds the state and logic of the application.
 pub struct App {
     /// Is the application running?
     running: bool,
-    itchy_listener: ItchTickListener,
+    rx: Receiver<color_eyre::Result<Packet>>,
+    stats: Stats,
     symbols: HashMap<String, f32>,
 }
 
 impl App {
-    pub fn new() -> Result<Self, std::io::Error> {
-        let itchy_listener = ItchTickListener::init()?;
+    pub fn new() -> std::io::Result<Self> {
+        let rx = spawn_reader()?;
         Ok(Self {
             running: true,
-            itchy_listener,
+            rx,
+            stats: Stats::default(),
             symbols: HashMap::<String, f32>::new(),
         })
     }
@@ -199,14 +210,17 @@ impl App {
     /// Run the application's main loop.
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         self.running = true;
-        // Ignore if there's no file here, ideally we would alert the user
-        // but not going to bother here since that isn't part of the demo
         let _ = self.load_symbols();
         let _ = self.load_stats();
         while self.running {
-            let messages = self.itchy_listener.receive()?;
-            for msg in messages.iter() {
-                match msg {
+            for result in self.rx.try_iter() {
+                let packet = result?;
+                if self.stats.update(packet.seq) {
+                    self.symbols.clear();
+                    continue;
+                }
+                self.stats.record_latency(packet.latency_us);
+                match packet.msg {
                     ItchyMessage::StockTick(trade) => {
                         self.symbols.insert(trade.symbol.to_owned(), trade.price);
                     }
@@ -215,8 +229,6 @@ impl App {
                     }
                 }
             }
-            // self.persist_symbols()?;
-            // self.persist_stats()?;
             terminal.draw(|frame| self.render(frame))?;
             self.handle_crossterm_events()?;
         }
@@ -231,7 +243,7 @@ impl App {
     }
 
     fn persist_stats(&self) -> color_eyre::Result<()> {
-        let bytes = rmp_serde::to_vec(&self.itchy_listener.stats)?;
+        let bytes = rmp_serde::to_vec(&self.stats)?;
         fs::write(".data/stats.msgpack", bytes)?;
         Ok(())
     }
@@ -244,16 +256,10 @@ impl App {
 
     fn load_stats(&mut self) -> color_eyre::Result<()> {
         let bytes = fs::read(".data/stats.msgpack")?;
-        self.itchy_listener.stats = rmp_serde::from_slice(&bytes)?;
+        self.stats = rmp_serde::from_slice(&bytes)?;
         Ok(())
     }
 
-    /// Renders the user interface.
-    ///
-    /// This is where you add new widgets. See the following resources for more information:
-    ///
-    /// - <https://docs.rs/ratatui/latest/ratatui/widgets/index.html>
-    /// - <https://github.com/ratatui/ratatui/tree/main/ratatui-widgets/examples>
     fn render(&mut self, frame: &mut Frame) {
         let outer_layout = Layout::default()
             .direction(Direction::Vertical)
@@ -269,9 +275,9 @@ impl App {
             .bold()
             .blue()
             .centered();
-        let status_txt = self.itchy_listener.stats.to_string();
+        let status_txt = self.stats.to_string();
         let text = format!(
-            "{status_txt} 
+            "{status_txt}
             Press `Esc`, `Ctrl-C` or `q` to stop running."
         );
         frame.render_widget(
