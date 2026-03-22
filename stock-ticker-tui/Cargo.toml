@@ -1,5 +1,5 @@
 [package]
-name = "ratatui-stock-ticker"
+name = "stock-ticker-tui"
 version = "0.1.0"
 description = "A quick tui for showing stock ticks for demonstration purposes"
 authors = ["Zach Burke <zach.r.burke@gmail.com>"]
