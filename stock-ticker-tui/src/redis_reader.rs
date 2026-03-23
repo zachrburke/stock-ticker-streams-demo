@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Sender, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use color_eyre::eyre::eyre;
+use redis::Connection;
 
 use crate::{ItchyMessage, Packet, Trade, reader::PacketReader};
 
@@ -42,13 +43,9 @@ impl PacketReader for RedisStreamReader {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            // First drain pending (unacknowledged) messages from a previous run
-            let mut reading_pending = true;
-            let mut pending_start = "0-0".to_string();
+            drain_pending(&mut con, &self.stream_key, &tx);
 
             loop {
-                let id_arg = if reading_pending { pending_start.as_str() } else { ">" };
-
                 let reply: redis::streams::StreamReadReply = match redis::cmd("XREADGROUP")
                     .arg("GROUP")
                     .arg(GROUP)
@@ -59,51 +56,101 @@ impl PacketReader for RedisStreamReader {
                     .arg(1000)
                     .arg("STREAMS")
                     .arg(&self.stream_key)
-                    .arg(id_arg)
+                    .arg(">")
                     .query(&mut con)
                 {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
 
-                if reading_pending {
-                    let has_entries = reply.keys.iter().any(|k| !k.ids.is_empty());
-                    if !has_entries {
-                        reading_pending = false;
-                        continue;
-                    }
-                }
-
-                for stream_key in &reply.keys {
-                    for entry in &stream_key.ids {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros();
-
-                        if reading_pending {
-                            pending_start = entry.id.clone();
-                        }
-
-                        let pairs = to_string_map(&entry.map);
-                        let result = parse_packet(pairs, now);
-
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&self.stream_key)
-                            .arg(GROUP)
-                            .arg(&entry.id)
-                            .query(&mut con);
-
-                        if tx.send(result).is_err() {
-                            return;
-                        }
-                    }
+                if !process_and_ack(&mut con, &self.stream_key, &reply, &tx) {
+                    return;
                 }
             }
         });
 
         Ok(rx)
     }
+}
+
+/// Reads all pending (unacknowledged) entries from a previous run, sends them
+/// over the channel, and ACKs them before returning.
+fn drain_pending(
+    con: &mut Connection,
+    stream_key: &str,
+    tx: &Sender<color_eyre::Result<Packet>>,
+) {
+    let mut pending_start = "0-0".to_string();
+    loop {
+        let reply: redis::streams::StreamReadReply = match redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(GROUP)
+            .arg(CONSUMER)
+            .arg("COUNT")
+            .arg(1000)
+            .arg("STREAMS")
+            .arg(stream_key)
+            .arg(&pending_start)
+            .query(con)
+        {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let has_entries = reply.keys.iter().any(|k| !k.ids.is_empty());
+        if !has_entries {
+            return;
+        }
+
+        for stream_key_entry in &reply.keys {
+            if let Some(last) = stream_key_entry.ids.last() {
+                pending_start = last.id.clone();
+            }
+        }
+
+        if !process_and_ack(con, stream_key, &reply, tx) {
+            return;
+        }
+    }
+}
+
+/// Parses entries, sends packets over the channel, and batch-ACKs.
+/// Returns false if the channel is closed.
+fn process_and_ack(
+    con: &mut Connection,
+    stream_key: &str,
+    reply: &redis::streams::StreamReadReply,
+    tx: &Sender<color_eyre::Result<Packet>>,
+) -> bool {
+    let mut ack_ids: Vec<String> = Vec::new();
+
+    for sk in &reply.keys {
+        for entry in &sk.ids {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+
+            ack_ids.push(entry.id.clone());
+            let pairs = to_string_map(&entry.map);
+            let result = parse_packet(pairs, now);
+
+            if tx.send(result).is_err() {
+                return false;
+            }
+        }
+    }
+
+    if !ack_ids.is_empty() {
+        let mut cmd = redis::cmd("XACK");
+        cmd.arg(stream_key).arg(GROUP);
+        for id in &ack_ids {
+            cmd.arg(id);
+        }
+        let _: Result<(), _> = cmd.query(con);
+    }
+
+    true
 }
 
 fn extract_str(value: &redis::Value) -> Option<String> {
