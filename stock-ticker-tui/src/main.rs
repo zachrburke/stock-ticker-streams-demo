@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use cadence::prelude::*;
+use cadence::{StatsdClient, UdpMetricSink, DEFAULT_PORT};
 use clap::Parser;
 use color_eyre::eyre::eyre;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -39,7 +41,7 @@ fn main() -> color_eyre::Result<()> {
         other => return Err(eyre!("unknown source: {other}")),
     };
     let terminal = ratatui::init();
-    let result = App::new(rx).run(terminal);
+    let result = App::new(rx, &cli.source).run(terminal);
     ratatui::restore();
     result
 }
@@ -94,12 +96,12 @@ impl Trade {
 
 const LATENCY_BATCH: u128 = 1000;
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub last_seq: u32,
     pub drop_count: u32,
     pub total_count: u32,
-    pub latency_us: u128,
+    pub latency_ns: u128,
     latency_sum: u128,
     latency_count: u128,
 }
@@ -123,19 +125,26 @@ impl Stats {
         self.latency_sum += latency_us;
         self.latency_count += 1;
         if self.latency_count >= LATENCY_BATCH {
-            self.latency_us = self.latency_sum / self.latency_count;
+            self.latency_ns = self.latency_sum / self.latency_count;
             self.latency_sum = 0;
             self.latency_count = 0;
         }
     }
 }
 
+fn new_statsd_client(source: &str) -> StatsdClient {
+    let host = ("0.0.0.0", DEFAULT_PORT);
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let sink = UdpMetricSink::from(host, socket).unwrap();
+    StatsdClient::from_sink(&format!("ticker.{source}"), sink)
+}
+
 impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "total:{},last:{},dropped:{},latency:{}us",
-            self.total_count, self.last_seq, self.drop_count, self.latency_us
+            "total:{},last:{},dropped:{},latency:{}ns",
+            self.total_count, self.last_seq, self.drop_count, self.latency_ns
         )
     }
 }
@@ -152,15 +161,17 @@ pub struct App {
     running: bool,
     rx: Receiver<color_eyre::Result<Packet>>,
     stats: Stats,
+    statsd: StatsdClient,
     symbols: HashMap<String, f32>,
 }
 
 impl App {
-    pub fn new(rx: Receiver<color_eyre::Result<Packet>>) -> Self {
+    pub fn new(rx: Receiver<color_eyre::Result<Packet>>, source: &str) -> Self {
         Self {
             running: true,
             rx,
             stats: Stats::default(),
+            statsd: new_statsd_client(source),
             symbols: HashMap::<String, f32>::new(),
         }
     }
@@ -173,11 +184,21 @@ impl App {
         while self.running {
             for result in self.rx.try_iter() {
                 let packet = result?;
+                let prev_drop_count = self.stats.drop_count;
                 if self.stats.update(packet.seq) {
                     self.symbols.clear();
                     continue;
                 }
+                let new_drops = self.stats.drop_count - prev_drop_count;
+                if new_drops > 0 {
+                    let _ = self.statsd.count("dropped", new_drops as i64);
+                }
+                let _ = self.statsd.count("total", 1);
+                let _ = self.statsd.time("latency_us", packet.latency_us as u64);
                 self.stats.record_latency(packet.latency_us);
+                if self.stats.latency_count == 0 {
+                    let _ = self.statsd.gauge("latency_avg_us", self.stats.latency_ns as u64);
+                }
                 match packet.msg {
                     ItchyMessage::StockTick(trade) => {
                         self.symbols.insert(trade.symbol.to_owned(), trade.price);
@@ -187,6 +208,8 @@ impl App {
                     }
                 }
             }
+            let _ = self.persist_symbols();
+            let _ = self.persist_stats();
             terminal.draw(|frame| self.render(frame))?;
             self.handle_crossterm_events()?;
         }
@@ -229,7 +252,7 @@ impl App {
             .constraints(vec![Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(outer_layout[0]);
 
-        let title = Line::from("Ratatui Simple Stock Ticker")
+        let title = Line::from("Simple Stock Ticker")
             .bold()
             .blue()
             .centered();
@@ -250,10 +273,14 @@ impl App {
     }
 
     fn watch_list_widget(&self, title: &str, list: &[&str]) -> List<'_> {
-        let items: Vec<ListItem> = self
+        let mut pairs: Vec<(&String, &f32)> = self
             .symbols
             .iter()
             .filter(|(sym, _)| list.contains(&sym.as_str()))
+            .collect();
+        pairs.sort_by_key(|(sym, _)| sym.as_str());
+        let items: Vec<ListItem> = pairs
+            .into_iter()
             .map(|(symbol, price)| ListItem::new(format!("{symbol:<6} ${price}")))
             .collect();
 

@@ -1,12 +1,13 @@
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::mpsc::{self, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use color_eyre::eyre::{Context, eyre};
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::{ItchyMessage, Packet, Trade, reader::PacketReader};
 
@@ -26,7 +27,12 @@ impl Default for UdpMulticastReader {
 
 impl PacketReader for UdpMulticastReader {
     fn spawn(self) -> color_eyre::Result<Receiver<color_eyre::Result<Packet>>> {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", self.port))?;
+        let socket2 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket2.set_reuse_port(true)?;
+        socket2.set_reuse_address(true)?;
+        let bind_addr: SocketAddr = format!("0.0.0.0:{}", self.port).parse()?;
+        socket2.bind(&bind_addr.into())?;
+        let socket: UdpSocket = socket2.into();
         socket.join_multicast_v4(&self.addr, &Ipv4Addr::UNSPECIFIED)?;
 
         let (tx, rx) = mpsc::channel();

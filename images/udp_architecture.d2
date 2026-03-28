@@ -1,0 +1,73 @@
+direction: right
+
+localhost: "Local Machine (127.0.0.1)" {
+  style.fill: "#f5f5f5"
+  style.stroke: "#999"
+
+  itch-file: 12302019.NASDAQ_ITCH50 {
+    shape: page
+    style.fill: "#e8e8e8"
+  }
+
+  transmitter: itchy-transmitter {
+    style.fill: "#4a90d9"
+    style.font-color: "#fff"
+    parse: "Parse ITCH 5.0 NonCrossTrade"
+    stamp: "Stamp seq + ts (epoch us)"
+    format: "Format datagram"
+  }
+
+  multicast: "UDP Multicast 239.255.0.1:1234" {
+    shape: queue
+    style.fill: "#f0ad4e"
+    style.font-color: "#fff"
+  }
+
+  tui: stock-ticker-tui {
+    style.fill: "#5cb85c"
+    style.font-color: "#fff"
+
+    reader-thread: Reader Thread {
+      style.fill: "#449d44"
+      style.font-color: "#fff"
+      socket: "UdpSocket (blocking)"
+      parse: "Parse into Packet"
+      measure: "now() - sender_ts"
+    }
+
+    channel: "mpsc::channel" {
+      shape: queue
+      style.fill: "#f0ad4e"
+      style.font-color: "#fff"
+    }
+
+    main-thread: Main Thread {
+      style.fill: "#449d44"
+      style.font-color: "#fff"
+      drain: "rx.try_iter()"
+      stats: "Update Stats"
+      render: "Render TUI (ratatui)"
+    }
+  }
+
+  itch-file -> transmitter.parse: read
+  transmitter.parse -> transmitter.stamp
+  transmitter.stamp -> transmitter.format
+  transmitter.format -> multicast: send_to
+
+  multicast -> tui.reader-thread.socket: recv_from
+  tui.reader-thread.socket -> tui.reader-thread.parse
+  tui.reader-thread.parse -> tui.reader-thread.measure
+  tui.reader-thread.measure -> tui.channel: "tx.send(Packet)"
+  tui.channel -> tui.main-thread.drain: "rx.try_iter()"
+  tui.main-thread.drain -> tui.main-thread.stats
+  tui.main-thread.stats -> tui.main-thread.render
+}
+
+note: |md
+  No real network latency exists.
+  All traffic flows over loopback (lo0).
+  The reader thread ensures packets are
+  consumed immediately from the kernel
+  buffer, independent of TUI render time.
+|

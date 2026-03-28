@@ -12,8 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
     let mut con = client.get_connection()?;
 
-    // Reset the stream on startup
-    redis::cmd("DEL").arg(STREAM_KEY).exec(&mut con).unwrap();
+    // Truncate the stream on startup, preserving consumer groups
+    let _: Result<(), _> = redis::cmd("XTRIM").arg(STREAM_KEY).arg("MAXLEN").arg(0).query(&mut con);
 
     let stream = itchy::MessageStream::from_file("12302019.NASDAQ_ITCH50")
         .expect("failed to read file with itchy, perhaps the file is missing.");

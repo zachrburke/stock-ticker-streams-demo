@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    process,
     sync::mpsc::{self, Sender, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -10,8 +11,9 @@ use redis::Connection;
 
 use crate::{ItchyMessage, Packet, Trade, reader::PacketReader};
 
-const GROUP: &str = "stock-ticker-tui";
-const CONSUMER: &str = "tui-1";
+fn group_name() -> String {
+    format!("stock-ticker-tui-{}", process::id())
+}
 
 pub struct RedisStreamReader {
     pub url: String,
@@ -32,10 +34,12 @@ impl PacketReader for RedisStreamReader {
         let client = redis::Client::open(self.url.as_str())?;
         let mut con = client.get_connection()?;
 
+        let group = group_name();
+
         let _: Result<(), _> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(&self.stream_key)
-            .arg(GROUP)
+            .arg(&group)
             .arg("0")
             .arg("MKSTREAM")
             .query(&mut con);
@@ -43,13 +47,13 @@ impl PacketReader for RedisStreamReader {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            drain_pending(&mut con, &self.stream_key, &tx);
+            drain_pending(&mut con, &self.stream_key, &group, &tx);
 
             loop {
                 let reply: redis::streams::StreamReadReply = match redis::cmd("XREADGROUP")
                     .arg("GROUP")
-                    .arg(GROUP)
-                    .arg(CONSUMER)
+                    .arg(&group)
+                    .arg(&group)
                     .arg("BLOCK")
                     .arg(100)
                     .arg("COUNT")
@@ -63,7 +67,7 @@ impl PacketReader for RedisStreamReader {
                     Err(_) => continue,
                 };
 
-                if !process_and_ack(&mut con, &self.stream_key, &reply, &tx) {
+                if !process_and_ack(&mut con, &self.stream_key, &group, &reply, &tx) {
                     return;
                 }
             }
@@ -78,14 +82,15 @@ impl PacketReader for RedisStreamReader {
 fn drain_pending(
     con: &mut Connection,
     stream_key: &str,
+    group: &str,
     tx: &Sender<color_eyre::Result<Packet>>,
 ) {
     let mut pending_start = "0-0".to_string();
     loop {
         let reply: redis::streams::StreamReadReply = match redis::cmd("XREADGROUP")
             .arg("GROUP")
-            .arg(GROUP)
-            .arg(CONSUMER)
+            .arg(group)
+            .arg(group)
             .arg("COUNT")
             .arg(1000)
             .arg("STREAMS")
@@ -108,7 +113,7 @@ fn drain_pending(
             }
         }
 
-        if !process_and_ack(con, stream_key, &reply, tx) {
+        if !process_and_ack(con, stream_key, group, &reply, tx) {
             return;
         }
     }
@@ -119,6 +124,7 @@ fn drain_pending(
 fn process_and_ack(
     con: &mut Connection,
     stream_key: &str,
+    group: &str,
     reply: &redis::streams::StreamReadReply,
     tx: &Sender<color_eyre::Result<Packet>>,
 ) -> bool {
@@ -143,7 +149,7 @@ fn process_and_ack(
 
     if !ack_ids.is_empty() {
         let mut cmd = redis::cmd("XACK");
-        cmd.arg(stream_key).arg(GROUP);
+        cmd.arg(stream_key).arg(group);
         for id in &ack_ids {
             cmd.arg(id);
         }
